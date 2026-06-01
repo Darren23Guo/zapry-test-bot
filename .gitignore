@@ -1,0 +1,8 @@
+.env
+bot.log
+bot.pid
+bot-state.json
+bot-state-*.json
+.idea/
+node_modules/
+npm-debug.log*

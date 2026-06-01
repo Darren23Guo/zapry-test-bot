@@ -1,0 +1,21 @@
+{
+  "name": "zapry-test-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.js",
+    "start:bg": "zsh -lc 'nohup node src/bot.js > bot.log 2>&1 < /dev/null & echo $! > bot.pid; disown; echo started $(cat bot.pid)'",
+    "stop": "sh -c 'if [ -f bot.pid ] && kill -0 $(cat bot.pid) 2>/dev/null; then kill $(cat bot.pid) && echo stopped $(cat bot.pid); else echo not running; fi'",
+    "service:start": "sh -c 'launchctl bootstrap gui/$(id -u) /Users/dazhaoguo/Library/LaunchAgents/com.zapry.test-bot.plist 2>/dev/null || true; launchctl kickstart -k gui/$(id -u)/com.zapry.test-bot'",
+    "service:stop": "sh -c 'launchctl bootout gui/$(id -u)/com.zapry.test-bot'",
+    "service:restart": "sh -c 'launchctl bootout gui/$(id -u)/com.zapry.test-bot 2>/dev/null || true; sleep 1; launchctl bootstrap gui/$(id -u) /Users/dazhaoguo/Library/LaunchAgents/com.zapry.test-bot.plist; launchctl kickstart -k gui/$(id -u)/com.zapry.test-bot'",
+    "service:status": "sh -c 'launchctl print gui/$(id -u)/com.zapry.test-bot'",
+    "logs": "tail -f bot.log",
+    "check": "node src/bot.js --check",
+    "once": "node src/bot.js --once"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
