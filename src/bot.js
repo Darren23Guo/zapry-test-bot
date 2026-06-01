@@ -7,7 +7,6 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 
 loadDotEnv(path.join(rootDir, ".env"));
-loadDotEnv(path.join(rootDir, ".env.local"), { override: true });
 
 const baseUrl = process.env.ZAPRY_API_BASE_URL || "https://openapi.mimo.immo";
 const pollTimeout = Number(process.env.ZAPRY_POLL_TIMEOUT || 30);
@@ -205,7 +204,7 @@ async function parseResponse(method, response) {
   return payload;
 }
 
-function loadDotEnv(filePath, options = {}) {
+function loadDotEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
 
   const content = fs.readFileSync(filePath, "utf8");
@@ -218,7 +217,7 @@ function loadDotEnv(filePath, options = {}) {
 
     const key = trimmed.slice(0, separator).trim();
     const value = stripInlineComment(trimmed.slice(separator + 1).trim()).replace(/^["']|["']$/g, "");
-    if (options.override || !process.env[key]) {
+    if (!process.env[key]) {
       process.env[key] = value;
     }
   }

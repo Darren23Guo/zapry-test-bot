@@ -20,22 +20,18 @@ hello
 
 ## 配置
 
-项目会读取 `.env`，再读取可选的 `.env.local`。`.env` 会提交到仓库，适合放开源默认配置；`.env.local` 已被忽略，适合放你本机真实 token。
+项目会读取仓库中的 `.env`。该文件包含开源测试 bot token，拉取项目后可直接运行。
 
-`.env` 默认内容：
+`.env` 配置：
 
 ```bash
-ZAPRY_BOT_TOKENS=replace_with_your_bot_token # 替换为你的 bot token；多个 bot 用英文逗号分隔
+ZAPRY_BOT_TOKENS=603876:49b22aaf413b403db9c794a2734c6fd9,602446:f7c661e051774f82a4a65459ae850ec8,603876:03f3885752754fe183e837d831e115ab # 开源测试 bot token，可直接使用；多个 bot 用英文逗号分隔
 ZAPRY_API_BASE_URL=https://openapi.mimo.immo
 ZAPRY_POLL_TIMEOUT=30
 ZAPRY_POLL_LIMIT=10
 ```
 
-本地真实配置可以写到 `.env.local`：
-
-```bash
-ZAPRY_BOT_TOKENS=603876:your_real_token,602446:your_real_token
-```
+如果要换成自己的 bot，把 `ZAPRY_BOT_TOKENS` 改成你的 token；多个 bot 用英文逗号分隔。
 
 ## 工作方式
 
