@@ -5,7 +5,6 @@
 ## 启动
 
 ```bash
-cd /Users/dazhaoguo/workspace/cyberflow/agent-card/zapry-test-bot
 npm run check
 npm run service:start
 ```
@@ -21,13 +20,21 @@ hello
 
 ## 配置
 
-`.env` 是本地配置文件，已经被 `.gitignore` 忽略。
+项目会读取 `.env`，再读取可选的 `.env.local`。`.env` 会提交到仓库，适合放开源默认配置；`.env.local` 已被忽略，适合放你本机真实 token。
+
+`.env` 默认内容：
 
 ```bash
-ZAPRY_BOT_TOKENS=bot_token_1,bot_token_2
+ZAPRY_BOT_TOKENS=replace_with_your_bot_token # 替换为你的 bot token；多个 bot 用英文逗号分隔
 ZAPRY_API_BASE_URL=https://openapi.mimo.immo
 ZAPRY_POLL_TIMEOUT=30
 ZAPRY_POLL_LIMIT=10
+```
+
+本地真实配置可以写到 `.env.local`：
+
+```bash
+ZAPRY_BOT_TOKENS=603876:your_real_token,602446:your_real_token
 ```
 
 ## 工作方式

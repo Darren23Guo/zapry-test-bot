@@ -1,4 +1,4 @@
-.env
+.env.local
 bot.log
 bot.pid
 bot-state.json

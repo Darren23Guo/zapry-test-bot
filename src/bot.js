@@ -7,6 +7,7 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 
 loadDotEnv(path.join(rootDir, ".env"));
+loadDotEnv(path.join(rootDir, ".env.local"), { override: true });
 
 const baseUrl = process.env.ZAPRY_API_BASE_URL || "https://openapi.mimo.immo";
 const pollTimeout = Number(process.env.ZAPRY_POLL_TIMEOUT || 30);
@@ -204,7 +205,7 @@ async function parseResponse(method, response) {
   return payload;
 }
 
-function loadDotEnv(filePath) {
+function loadDotEnv(filePath, options = {}) {
   if (!fs.existsSync(filePath)) return;
 
   const content = fs.readFileSync(filePath, "utf8");
@@ -216,11 +217,22 @@ function loadDotEnv(filePath) {
     if (separator === -1) continue;
 
     const key = trimmed.slice(0, separator).trim();
-    const value = trimmed.slice(separator + 1).trim().replace(/^["']|["']$/g, "");
-    if (!process.env[key]) {
+    const value = stripInlineComment(trimmed.slice(separator + 1).trim()).replace(/^["']|["']$/g, "");
+    if (options.override || !process.env[key]) {
       process.env[key] = value;
     }
   }
+}
+
+function stripInlineComment(value) {
+  if (value.startsWith("\"") || value.startsWith("'")) return value;
+
+  const hashCommentStart = value.search(/\s#/);
+  const slashCommentStart = value.search(/\s\/\//);
+  const commentStarts = [hashCommentStart, slashCommentStart].filter((index) => index !== -1);
+  const commentStart = commentStarts.length > 0 ? Math.min(...commentStarts) : -1;
+
+  return commentStart === -1 ? value : value.slice(0, commentStart).trim();
 }
 
 function parseBotTokens() {
