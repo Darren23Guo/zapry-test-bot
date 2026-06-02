@@ -106,6 +106,11 @@ async function handleUpdate(bot, update) {
     return;
   }
 
+  if (update.modal_submit) {
+    await handleModalSubmit(bot, update.modal_submit);
+    return;
+  }
+
   const message = update.message;
   if (!message?.chat?.id) return;
 
@@ -122,6 +127,9 @@ async function handleUpdate(bot, update) {
       "/help - 查看命令",
       "/id - 查看当前 chat/user 信息",
       "hello - 测试普通消息回复",
+      "/card - 发送 Agent Card 测试卡",
+      "/choice - 发送 choice_group 测试卡",
+      "/modal - 发送 Modal 测试卡",
     ].join("\n"));
     return;
   }
@@ -133,8 +141,11 @@ async function handleUpdate(bot, update) {
       "/start - 启动问候",
       "/id - 返回当前 chat_id 和 user_id",
       "hello - 回复一条测试消息",
+      "/card - 发送 Agent Card 测试卡，包含 toast / defer + editMessage / 服务端 Modal / 本地 Modal",
+      "/choice - 发送 choice_group 测试卡，按钮点击时提交 component_values",
+      "/modal - 发送 Modal 测试卡，覆盖 client-side modal 和 server-side modal",
       "",
-      "后面可以在这里接你的业务逻辑，比如审批、查询、发卡片、调用 AI。"
+      "注意：当前测试 bot 不发送真实 PaymentCard，避免误触发钱包签名。"
     ].join("\n"));
     return;
   }
@@ -156,19 +167,175 @@ async function handleUpdate(bot, update) {
     return;
   }
 
+  if (isAgentCardCommand(text)) {
+    await sendAgentCard(bot, message.chat.id);
+    return;
+  }
+
+  if (isChoiceCommand(text)) {
+    await sendChoiceCard(bot, message.chat.id);
+    return;
+  }
+
+  if (isModalCommand(text)) {
+    await sendModalCard(bot, message.chat.id);
+    return;
+  }
+
+  if (isPaymentCardCommand(text)) {
+    await sendMessage(bot, message.chat.id, [
+      "PaymentCard 是高风险支付组件，测试 bot 暂不直接下发真实 payment_card。",
+      "请先用 /card、/choice、/modal 验证基础 Agent Card 链路；真实 PaymentCard 建议用测试钱包和专门业务 bot 跑。"
+    ].join("\n"));
+    return;
+  }
+
   await sendMessage(bot, message.chat.id, `收到：${text}`);
 }
 
 async function handleCallback(bot, callbackQuery) {
-  console.log(`[bot ${bot.id}] Received callback: ${callbackQuery.data || callbackQuery.value || "(empty)"}`);
+  const data = callbackData(callbackQuery);
+  console.log(`[bot ${bot.id}] Received callback: ${data || "(empty)"}`);
 
   if (!callbackQuery.id) return;
 
-  await apiPost(bot, "answerCallbackQuery", {
-    callback_query_id: callbackQuery.id,
+  if (data === "agent_card:toast") {
+    await answerCallback(bot, callbackQuery, {
+      response_type: "toast",
+      text: "测试 bot 已收到按钮点击",
+    });
+    return;
+  }
+
+  if (data === "agent_card:defer_edit") {
+    await answerCallback(bot, callbackQuery, {
+      response_type: "defer",
+    });
+    await sleep(1200);
+    await editCallbackSource(bot, callbackQuery, {
+      fallback_text: "Agent Card 测试：已通过 editMessage 更新",
+      components: [
+        { type: "section", id: "agent_card_done_title", text: "Agent Card 已更新" },
+        { type: "status", id: "agent_card_done_status", text: "状态：success" },
+        { type: "notice", id: "agent_card_done_notice", text: "这条消息由 bot 调用 editMessage 原地更新，没有新增聊天消息。" },
+        {
+          type: "action_group",
+          id: "agent_card_done_actions",
+          components: [
+            {
+              type: "button",
+              id: "agent_card_done_button",
+              text: "已完成",
+              style: "secondary",
+              state: "disabled",
+              disabled: true
+            }
+          ]
+        }
+      ]
+    });
+    return;
+  }
+
+  if (data === "agent_card:server_modal") {
+    await answerCallback(bot, callbackQuery, {
+      response_type: "open_modal",
+      modal: {
+        modal_id: "agent_card_server_modal",
+        title: "服务端 Modal 测试",
+        metadata: { source: "zapry-test-bot", callback_data: data },
+        components: [
+          {
+            type: "text_input",
+            id: "note",
+            label: "备注",
+            placeholder: "输入一段测试内容"
+          },
+          {
+            type: "choice_group",
+            id: "priority",
+            title: "优先级",
+            mode: "single",
+            style: "radio",
+            value: "normal",
+            options: [
+              { value: "low", label: "低" },
+              { value: "normal", label: "普通" },
+              { value: "high", label: "高" }
+            ]
+          }
+        ]
+      }
+    });
+    return;
+  }
+
+  if (data === "agent_card:submit_choice") {
+    const values = componentValues(callbackQuery);
+    const selected = humanReadableValues(values);
+    await answerCallback(bot, callbackQuery, {
+      response_type: "toast",
+      text: `已收到选择：${selected || "空"}`,
+    });
+    await editCallbackSource(bot, callbackQuery, {
+      fallback_text: `Agent Card choice_group：${selected || "未选择"}`,
+      components: [
+        { type: "section", id: "choice_done_title", text: "choice_group 已提交" },
+        { type: "notice", id: "choice_done_notice", text: `收到的 component_values：${selected || "空"}` },
+        {
+          type: "action_group",
+          id: "choice_done_actions",
+          components: [
+            {
+              type: "button",
+              id: "choice_done_button",
+              text: "重新发送选择卡",
+              style: "primary",
+              action: { type: "callback", value: "agent_card:resend_choice" },
+              callback_data: "agent_card:resend_choice"
+            }
+          ]
+        }
+      ]
+    });
+    return;
+  }
+
+  if (data === "agent_card:resend_choice") {
+    await answerCallback(bot, callbackQuery, {
+      response_type: "toast",
+      text: "正在重新发送选择卡",
+    });
+    const chatId = callbackChatId(callbackQuery);
+    if (chatId) {
+      await sendChoiceCard(bot, chatId);
+    }
+    return;
+  }
+
+  await answerCallback(bot, callbackQuery, {
     response_type: "toast",
     text: "测试 bot 已收到按钮点击",
   });
+}
+
+async function handleModalSubmit(bot, modalSubmit) {
+  const modalId = modalSubmit.modal_id || modalSubmit.modalId || "(unknown)";
+  const values = parseMaybeJSON(modalSubmit.values) || modalSubmit.values || {};
+  console.log(`[bot ${bot.id}] Received modal_submit: ${modalId} values=${JSON.stringify(values)}`);
+
+  const chatId = modalSubmit.source_message?.chat?.id
+    || modalSubmit.sourceMessage?.chat?.id
+    || modalSubmit.chat?.id
+    || modalSubmit.chat_id
+    || modalSubmit.chatId;
+
+  if (chatId) {
+    await sendMessage(bot, chatId, [
+      `收到 Modal 提交：${modalId}`,
+      `values: ${humanReadableValues(values) || "空"}`
+    ].join("\n"));
+  }
 }
 
 async function sendMessage(bot, chatId, text) {
@@ -176,6 +343,291 @@ async function sendMessage(bot, chatId, text) {
     chat_id: String(chatId),
     text,
   });
+}
+
+async function sendComponentMessage(bot, chatId, { text, fallback_text, components }) {
+  await apiPost(bot, "sendMessage", {
+    chat_id: String(chatId),
+    text,
+    fallback_text,
+    components,
+  });
+}
+
+async function sendAgentCard(bot, chatId) {
+  await sendComponentMessage(bot, chatId, {
+    text: "Agent Card 测试",
+    fallback_text: "Agent Card 测试：按钮、Modal、editMessage",
+    components: [
+      { type: "section", id: "agent_card_title", text: "Agent Card 测试" },
+      { type: "notice", id: "agent_card_notice", text: "这张卡用于验证 sendMessage.components、callback_query、answerCallbackQuery 和 editMessage。" },
+      {
+        type: "action_group",
+        id: "agent_card_actions",
+        components: [
+          callbackButton("agent_card_toast", "Toast", "agent_card:toast", "secondary"),
+          callbackButton("agent_card_defer", "Defer + edit", "agent_card:defer_edit", "primary"),
+          callbackButton("agent_card_server_modal", "服务端 Modal", "agent_card:server_modal", "secondary")
+        ]
+      },
+      {
+        type: "action_group",
+        id: "agent_card_more_actions",
+        components: [
+          {
+            type: "button",
+            id: "agent_card_client_modal",
+            text: "本地 Modal",
+            style: "secondary",
+            action: {
+              type: "open_modal",
+              modal: clientSideModalPayload()
+            }
+          },
+          {
+            type: "button",
+            id: "agent_card_docs",
+            text: "打开文档",
+            style: "secondary",
+            action: {
+              type: "open_url",
+              value: "https://zapry.ai/developers/docs/api-reference"
+            }
+          }
+        ]
+      }
+    ]
+  });
+}
+
+async function sendChoiceCard(bot, chatId) {
+  await sendComponentMessage(bot, chatId, {
+    text: "Agent Card choice_group 测试",
+    fallback_text: "Agent Card choice_group 测试",
+    components: [
+      { type: "section", id: "choice_title", text: "选择一个测试场景" },
+      {
+        type: "choice_group",
+        id: "agent_card_case",
+        title: "场景",
+        mode: "single",
+        style: "radio",
+        value: "render",
+        options: [
+          { value: "render", label: "渲染", description: "验证 section/notice/button" },
+          { value: "modal", label: "Modal", description: "验证表单弹出和提交" },
+          { value: "edit", label: "状态更新", description: "验证 editMessage 原地更新" }
+        ]
+      },
+      {
+        type: "choice_group",
+        id: "agent_card_platforms",
+        title: "平台",
+        mode: "multiple",
+        style: "checkbox",
+        value: ["ios"],
+        options: [
+          { value: "ios", label: "iOS" },
+          { value: "android", label: "Android" },
+          { value: "server", label: "Server" }
+        ]
+      },
+      {
+        type: "action_group",
+        id: "choice_actions",
+        components: [
+          {
+            ...callbackButton("choice_submit", "提交选择", "agent_card:submit_choice", "primary"),
+            include_values: ["agent_card_case", "agent_card_platforms"]
+          }
+        ]
+      }
+    ]
+  });
+}
+
+async function sendModalCard(bot, chatId) {
+  await sendComponentMessage(bot, chatId, {
+    text: "Agent Card Modal 测试",
+    fallback_text: "Agent Card Modal 测试",
+    components: [
+      { type: "section", id: "modal_title", text: "Modal 测试" },
+      { type: "notice", id: "modal_notice", text: "本地 Modal 不产生 callback；服务端 Modal 通过 answerCallbackQuery.open_modal 下发。" },
+      {
+        type: "action_group",
+        id: "modal_actions",
+        components: [
+          {
+            type: "button",
+            id: "client_modal",
+            text: "本地 Modal",
+            style: "primary",
+            action: {
+              type: "open_modal",
+              modal: clientSideModalPayload()
+            }
+          },
+          callbackButton("server_modal", "服务端 Modal", "agent_card:server_modal", "secondary")
+        ]
+      }
+    ]
+  });
+}
+
+function callbackButton(id, text, value, style = "secondary") {
+  return {
+    type: "button",
+    id,
+    text,
+    style,
+    action: { type: "callback", value },
+    callback_data: value,
+  };
+}
+
+function clientSideModalPayload() {
+  return {
+    modal_id: "agent_card_client_modal",
+    title: "本地 Modal 测试",
+    description: "这个 Modal 由客户端直接打开，不先发送 callback_query。",
+    submit_text: "提交",
+    components: [
+      {
+        type: "text_input",
+        id: "comment",
+        label: "备注",
+        placeholder: "输入任意测试内容"
+      },
+      {
+        type: "choice_group",
+        id: "channel",
+        title: "提交来源",
+        mode: "single",
+        style: "radio",
+        value: "client_modal",
+        options: [
+          { value: "client_modal", label: "本地 Modal" },
+          { value: "manual", label: "手动测试" }
+        ]
+      }
+    ],
+    metadata: { source: "zapry-test-bot" }
+  };
+}
+
+async function answerCallback(bot, callbackQuery, body) {
+  const chatId = callbackChatId(callbackQuery);
+  await apiPost(bot, "answerCallbackQuery", {
+    chat_id: chatId ? String(chatId) : "",
+    callback_query_id: callbackQuery.id,
+    ...body,
+  });
+}
+
+async function editCallbackSource(bot, callbackQuery, body) {
+  const chatId = callbackChatId(callbackQuery);
+  const messageId = callbackMessageId(callbackQuery);
+  if (!chatId || !messageId) {
+    await answerCallback(bot, callbackQuery, {
+      response_type: "alert",
+      text: "缺少 source message，无法 editMessage",
+    }).catch(() => {});
+    console.warn(`[bot ${bot.id}] Missing source message for editMessage: chat=${chatId || "(empty)"} message=${messageId || "(empty)"}`);
+    return;
+  }
+
+  await apiPost(bot, "editMessage", {
+    chat_id: String(chatId),
+    message_id: String(messageId),
+    ...body,
+  });
+}
+
+function isAgentCardCommand(text) {
+  const normalized = text.toLowerCase();
+  return normalized === "/card"
+    || normalized === "card"
+    || normalized === "agent card"
+    || text === "测试卡片"
+    || text === "测试Agent Card"
+    || text === "测试agent card";
+}
+
+function isChoiceCommand(text) {
+  const normalized = text.toLowerCase();
+  return normalized === "/choice"
+    || normalized === "choice"
+    || text === "测试选择"
+    || text === "测试choice";
+}
+
+function isModalCommand(text) {
+  const normalized = text.toLowerCase();
+  return normalized === "/modal"
+    || normalized === "modal"
+    || text === "测试modal"
+    || text === "测试Modal";
+}
+
+function isPaymentCardCommand(text) {
+  const normalized = text.toLowerCase();
+  return normalized === "/payment"
+    || normalized === "/paymentcard"
+    || normalized === "paymentcard"
+    || normalized === "payment card"
+    || text === "测试支付卡";
+}
+
+function callbackData(callbackQuery) {
+  return callbackQuery.data
+    || callbackQuery.value
+    || callbackQuery.callback_data
+    || callbackQuery.callbackData
+    || "";
+}
+
+function callbackChatId(callbackQuery) {
+  return callbackQuery.message?.chat?.id
+    || callbackQuery.source_message?.chat?.id
+    || callbackQuery.sourceMessage?.chat?.id
+    || callbackQuery.chat?.id
+    || callbackQuery.chat_id
+    || callbackQuery.chatId
+    || "";
+}
+
+function callbackMessageId(callbackQuery) {
+  return callbackQuery.message?.message_id
+    || callbackQuery.message?.messageId
+    || callbackQuery.source_message?.message_id
+    || callbackQuery.sourceMessage?.messageId
+    || callbackQuery.message_id
+    || callbackQuery.messageId
+    || "";
+}
+
+function componentValues(callbackQuery) {
+  return parseMaybeJSON(callbackQuery.component_values)
+    || parseMaybeJSON(callbackQuery.componentValues)
+    || callbackQuery.component_values
+    || callbackQuery.componentValues
+    || {};
+}
+
+function parseMaybeJSON(value) {
+  if (!value || typeof value !== "string") return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function humanReadableValues(values) {
+  if (!values || typeof values !== "object") return "";
+  return Object.entries(values)
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join("|") : String(value)}`)
+    .join(", ");
 }
 
 async function apiGet(bot, method) {

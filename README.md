@@ -16,6 +16,9 @@ npm run service:start
 hello
 /id
 /help
+/card
+/choice
+/modal
 ```
 
 ## 配置
@@ -32,6 +35,24 @@ ZAPRY_POLL_LIMIT=10
 ```
 
 如果要换成自己的 bot，把 `ZAPRY_BOT_TOKENS` 改成你的 token；多个 bot 用英文逗号分隔。
+
+## Agent Card 测试
+
+当前测试 bot 支持一组非支付类 Agent Card smoke 用例：
+
+- `/card`：发送基础 Agent Card，包含 toast ack、`defer + editMessage`、服务端 Modal、本地 Modal、打开文档按钮。
+- `/choice`：发送 `choice_group` 测试卡，提交时会把 `component_values` 回传给 bot，并用 `editMessage` 原地更新卡片。
+- `/modal`：发送 Modal 测试卡，覆盖 client-side Modal 和 server-side Modal。
+
+也可以发送中文触发词：
+
+```text
+测试卡片
+测试选择
+测试modal
+```
+
+为了避免误触发钱包签名或真实支付，当前测试 bot 不直接发送真实 `payment_card`。PaymentCard 请使用测试钱包和专门业务 bot 跑。
 
 ## 工作方式
 
