@@ -9,6 +9,13 @@ npm run check
 npm run service:start
 ```
 
+测试服务环境：
+
+```bash
+npm run check:test
+npm run start:test
+```
+
 启动后，在 Zapry iOS / Android 里给 bot 发：
 
 ```text
@@ -23,7 +30,7 @@ hello
 
 ## 配置
 
-项目会读取仓库中的 `.env`。该文件包含开源测试 bot token，拉取项目后可直接运行。
+项目默认读取仓库中的 `.env`。该文件包含开源测试 bot token，拉取项目后可直接运行。
 
 `.env` 配置：
 
@@ -35,6 +42,23 @@ ZAPRY_POLL_LIMIT=10
 ```
 
 如果要换成自己的 bot，把 `ZAPRY_BOT_TOKENS` 改成你的 token；多个 bot 用英文逗号分隔。
+
+测试服务环境使用 `.env.test`，并配置测试环境 bot token：
+
+```bash
+ZAPRY_API_BASE_URL=https://openapi-dev.mimo.immo
+ZAPRY_BOT_TOKENS=850709:d06709013bca4533ae42e3bd0b5bedbd
+ZAPRY_POLL_TIMEOUT=30
+ZAPRY_POLL_LIMIT=10
+```
+
+脚本也兼容 `OPENAPI=https://openapi-dev.mimo.immo` 这个别名，但推荐继续使用 `ZAPRY_API_BASE_URL`。
+
+也可以通过命令行临时切换：
+
+```bash
+node src/bot.js --env test --check
+```
 
 ## Agent Card 测试
 

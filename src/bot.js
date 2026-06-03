@@ -5,16 +5,21 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
+const runtimeOptions = parseRuntimeOptions(process.argv.slice(2));
+const activeEnvName = normalizeEnvName(runtimeOptions.envName || process.env.ZAPRY_ENV);
 
+if (activeEnvName) {
+  loadDotEnv(path.join(rootDir, `.env.${activeEnvName}`));
+}
 loadDotEnv(path.join(rootDir, ".env"));
 
-const baseUrl = process.env.ZAPRY_API_BASE_URL || "https://openapi.mimo.immo";
+const baseUrl = normalizeBaseUrl(process.env.ZAPRY_API_BASE_URL || process.env.OPENAPI || "https://openapi.mimo.immo");
 const pollTimeout = Number(process.env.ZAPRY_POLL_TIMEOUT || 30);
 const pollLimit = Number(process.env.ZAPRY_POLL_LIMIT || 10);
 const bots = parseBotTokens();
 
 if (bots.length === 0) {
-  console.error("Missing bot token. Put ZAPRY_BOT_TOKENS or ZAPRY_BOT_TOKEN in .env.");
+  console.error("Missing bot token. Put ZAPRY_BOT_TOKENS or ZAPRY_BOT_TOKEN in .env or the active .env.<env> file.");
   process.exit(1);
 }
 
@@ -31,7 +36,8 @@ process.on("SIGTERM", () => {
 });
 
 async function main() {
-  const mode = process.argv[2] || "start";
+  const mode = runtimeOptions.mode || "start";
+  console.log(`Zapry API: ${baseUrl}${activeEnvName ? ` (${activeEnvName})` : ""}`);
 
   if (mode === "--check") {
     for (const bot of bots) {
@@ -631,18 +637,30 @@ function humanReadableValues(values) {
 }
 
 async function apiGet(bot, method) {
-  const response = await fetch(`${baseUrl}/${bot.token}/${method}`);
+  const response = await fetchAPI(bot, method);
   return parseResponse(method, response);
 }
 
 async function apiPost(bot, method, body = {}) {
-  const response = await fetch(`${baseUrl}/${bot.token}/${method}`, {
+  const response = await fetchAPI(bot, method, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 
   return parseResponse(method, response);
+}
+
+async function fetchAPI(bot, method, options) {
+  try {
+    return await fetch(`${baseUrl}/${bot.token}/${method}`, options);
+  } catch (error) {
+    throw new Error(`${method} request failed for ${baseUrl}: ${networkErrorMessage(error)}`);
+  }
+}
+
+function networkErrorMessage(error) {
+  return error?.cause?.message || error?.message || "Unknown network error";
 }
 
 async function parseResponse(method, response) {
@@ -686,6 +704,41 @@ function stripInlineComment(value) {
   return commentStart === -1 ? value : value.slice(0, commentStart).trim();
 }
 
+function parseRuntimeOptions(args) {
+  const options = {
+    mode: "",
+    envName: "",
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--env" || arg === "-e") {
+      options.envName = args[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--env=")) {
+      options.envName = arg.slice("--env=".length);
+      continue;
+    }
+    if (!options.mode) {
+      options.mode = arg;
+    }
+  }
+
+  return options;
+}
+
+function normalizeEnvName(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized || normalized === "production") return "";
+  return normalized.replace(/[^a-z0-9_-]/g, "");
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
 function parseBotTokens() {
   const rawTokens = process.env.ZAPRY_BOT_TOKENS || process.env.ZAPRY_BOT_TOKEN || "";
   const tokens = rawTokens
@@ -700,7 +753,8 @@ function parseBotTokens() {
     idCounts.set(baseId, nextCount);
 
     const id = nextCount === 1 ? baseId : `${baseId}_${nextCount}`;
-    const stateFile = path.join(rootDir, `bot-state-${id}.json`);
+    const stateEnvPrefix = activeEnvName ? `${activeEnvName}-` : "";
+    const stateFile = path.join(rootDir, `bot-state-${stateEnvPrefix}${id}.json`);
 
     return {
       id,
