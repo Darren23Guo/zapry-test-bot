@@ -16,7 +16,11 @@
     "once": "node src/bot.js --once",
     "start:test": "ZAPRY_ENV=test node src/bot.js",
     "check:test": "ZAPRY_ENV=test node src/bot.js --check",
-    "once:test": "ZAPRY_ENV=test node src/bot.js --once"
+    "once:test": "ZAPRY_ENV=test node src/bot.js --once",
+    "smoke": "node test/smoke.js",
+    "smoke:test": "ZAPRY_ENV=test node test/smoke.js",
+    "smoke:check:test": "ZAPRY_ENV=test node test/smoke.js --no-send",
+    "smoke:all:test": "ZAPRY_ENV=test node test/smoke.js --all"
   },
   "engines": {
     "node": ">=18"

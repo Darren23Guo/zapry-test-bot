@@ -13,6 +13,8 @@ npm run service:start
 
 ```bash
 npm run check:test
+npm run smoke:check:test
+npm run smoke:test
 npm run start:test
 ```
 
@@ -47,7 +49,7 @@ ZAPRY_POLL_LIMIT=10
 
 ```bash
 ZAPRY_API_BASE_URL=https://openapi-dev.mimo.immo
-ZAPRY_BOT_TOKENS=850709:d06709013bca4533ae42e3bd0b5bedbd
+ZAPRY_BOT_TOKENS=850672:637158a8a29f4d45a62afb1e736039e9,850709:d06709013bca4533ae42e3bd0b5bedbd
 ZAPRY_POLL_TIMEOUT=30
 ZAPRY_POLL_LIMIT=10
 ```
@@ -59,6 +61,72 @@ ZAPRY_POLL_LIMIT=10
 ```bash
 node src/bot.js --env test --check
 ```
+
+## OpenAPI Smoke 验证
+
+不启动长轮询 bot，也可以直接跑 OpenAPI 链路 smoke：
+
+```bash
+npm run smoke:test
+```
+
+smoke 脚本放在 `test/smoke.js`，和 `src/bot.js` 运行时代码分开。
+
+默认只使用 `ZAPRY_BOT_TOKENS` 里的第一个 token，验证：
+
+- `getMe`
+- `getWebhookInfo`
+- 私聊 `sendMessage`
+- 私聊 `sendLinkCard`
+- 群聊 `sendLinkCard`（需要额外配置群 id）
+
+只检查环境和 token，不发送消息：
+
+```bash
+npm run smoke:check:test
+```
+
+验证群聊 link card：
+
+```bash
+ZAPRY_SMOKE_GROUP_CHAT_ID=g_<测试群id> npm run smoke:test
+```
+
+如果只知道纯群号，也可以不写 `g_`，脚本会自动补前缀：
+
+```bash
+ZAPRY_SMOKE_GROUP_CHAT_ID=<测试群id> npm run smoke:test
+```
+
+测试所有配置的 bot：
+
+```bash
+npm run smoke:all:test
+```
+
+指定某个 bot：
+
+```bash
+ZAPRY_SMOKE_BOT_ID=850709 npm run smoke:test
+```
+
+期望结果：
+
+```text
+OK   getMe
+OK   getWebhookInfo
+OK   sendMessage private
+OK   sendLinkCard private
+OK   sendLinkCard group
+Smoke summary: 1/1 bot(s) passed.
+```
+
+常见失败含义：
+
+- `invalid message type`：群 link card 还在旧环信 group send 路径，或 `huanxin-im-provider` 未部署修复。
+- `bot_private_dm_unsupported_message_type`：`mimo-im/im-rpc` 未部署支持 `link_share_card` 的版本。
+- `access denied` / `403`：bot 没进群，或群权限 / group privacy 不允许。
+- `ENOTFOUND` / timeout：本机 DNS、VPN、网络或测试入口不可达。
 
 ## Agent Card 测试
 
