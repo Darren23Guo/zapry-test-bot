@@ -17,6 +17,8 @@
     "start:test": "ZAPRY_ENV=test node src/bot.js",
     "check:test": "ZAPRY_ENV=test node src/bot.js --check",
     "once:test": "ZAPRY_ENV=test node src/bot.js --once",
+    "webhook": "node src/bot.js --webhook",
+    "webhook:test": "ZAPRY_ENV=test node src/bot.js --webhook",
     "smoke": "node test/smoke.js",
     "smoke:test": "ZAPRY_ENV=test node test/smoke.js",
     "smoke:check:test": "ZAPRY_ENV=test node test/smoke.js --no-send",

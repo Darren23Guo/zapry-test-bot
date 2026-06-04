@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +18,8 @@ const baseUrl = normalizeBaseUrl(process.env.ZAPRY_API_BASE_URL || process.env.O
 const pollTimeout = Number(process.env.ZAPRY_POLL_TIMEOUT || 30);
 const pollLimit = Number(process.env.ZAPRY_POLL_LIMIT || 10);
 const bots = parseBotTokens();
+const defaultWebhookPath = "/zapry/webhooks";
+const maxWebhookBodyBytes = 1024 * 1024;
 
 if (bots.length === 0) {
   console.error("Missing bot token. Put ZAPRY_BOT_TOKENS or ZAPRY_BOT_TOKEN in .env or the active .env.<env> file.");
@@ -24,35 +27,49 @@ if (bots.length === 0) {
 }
 
 let stopping = false;
+let activeServer = null;
 
-process.on("SIGINT", () => {
+process.on("SIGINT", requestStop);
+process.on("SIGTERM", requestStop);
+
+function requestStop() {
+  if (stopping) return;
   stopping = true;
   console.log("\nStopping after current request...");
-});
-
-process.on("SIGTERM", () => {
-  stopping = true;
-  console.log("\nStopping after current request...");
-});
+  if (activeServer) {
+    activeServer.close(() => {
+      console.log("Webhook server stopped.");
+    });
+  }
+}
 
 async function main() {
-  const mode = runtimeOptions.mode || "start";
+  const mode = normalizeRunMode(runtimeOptions.mode || process.env.ZAPRY_RUN_MODE || "polling");
   console.log(`Zapry API: ${baseUrl}${activeEnvName ? ` (${activeEnvName})` : ""}`);
 
-  if (mode === "--check") {
+  if (mode === "check") {
     for (const bot of bots) {
       await checkBot(bot);
     }
     return;
   }
 
+  if (mode === "webhook") {
+    await runWebhookMode();
+    return;
+  }
+
   await Promise.all(bots.map((bot) => preparePollingMode(bot)));
 
-  if (mode === "--once") {
+  if (mode === "once") {
     await Promise.all(bots.map((bot) => pollOnce(bot)));
     return;
   }
 
+  await runPollingMode();
+}
+
+async function runPollingMode() {
   console.log(`Zapry test bot runner is running for ${bots.length} bot(s).`);
   console.log(`Bot IDs: ${bots.map((bot) => bot.id).join(", ")}`);
   console.log("Try sending /start, hello, /id, or /help to the bot.");
@@ -67,6 +84,259 @@ async function main() {
       }
     }));
   }
+}
+
+async function runWebhookMode() {
+  const webhookConfig = buildWebhookConfig();
+  const server = await listenWebhookServer(webhookConfig);
+  const address = server.address();
+  const localPort = typeof address === "object" && address ? address.port : webhookConfig.port;
+  console.log(`Webhook receiver listening on http://${webhookConfig.host}:${localPort}${webhookConfig.path}`);
+  console.log(`Webhook receiver accepts per-bot paths like ${webhookConfig.path}/${bots[0].id}`);
+
+  if (webhookConfig.noSetWebhook) {
+    console.log("Webhook registration skipped because --no-set-webhook / ZAPRY_WEBHOOK_NO_SET is enabled.");
+  } else {
+    await Promise.all(bots.map((bot) => prepareWebhookMode(bot, webhookConfig)));
+  }
+
+  console.log(`Zapry webhook bot runner is running for ${bots.length} bot(s).`);
+  console.log(`Bot IDs: ${bots.map((bot) => bot.id).join(", ")}`);
+  console.log("Try sending /start, hello, /id, or /help to the bot.");
+
+  await waitForServerClose(server);
+}
+
+function buildWebhookConfig() {
+  const publicUrl = normalizeWebhookUrl(runtimeOptions.webhookUrl || process.env.ZAPRY_WEBHOOK_URL || "");
+  const urlPath = publicUrl ? new URL(publicUrl).pathname : "";
+  const pathValue = runtimeOptions.webhookPath || process.env.ZAPRY_WEBHOOK_PATH || urlPath || defaultWebhookPath;
+  const port = Number(runtimeOptions.webhookPort || process.env.ZAPRY_WEBHOOK_PORT || 8080);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("ZAPRY_WEBHOOK_PORT must be an integer from 0 to 65535.");
+  }
+
+  const noSetWebhook = runtimeOptions.noSetWebhook || isTruthy(process.env.ZAPRY_WEBHOOK_NO_SET);
+  if (!publicUrl && !noSetWebhook) {
+    throw new Error("Missing ZAPRY_WEBHOOK_URL. Set it to your public HTTPS callback URL, or pass --no-set-webhook for local receiver-only testing.");
+  }
+
+  return {
+    publicUrl,
+    path: normalizeWebhookPath(pathValue),
+    host: runtimeOptions.webhookHost || process.env.ZAPRY_WEBHOOK_HOST || "0.0.0.0",
+    port,
+    secretToken: runtimeOptions.webhookSecretToken || process.env.ZAPRY_WEBHOOK_SECRET_TOKEN || "",
+    verifySecret: runtimeOptions.verifyWebhookSecret || isTruthy(process.env.ZAPRY_WEBHOOK_VERIFY_SECRET),
+    noSetWebhook,
+  };
+}
+
+function listenWebhookServer(webhookConfig) {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      handleWebhookRequest(req, res, webhookConfig).catch((error) => {
+        console.error(`Webhook request failed: ${error.message}`);
+        if (!res.headersSent) {
+          sendJson(res, 500, { ok: false, error: error.message });
+        } else {
+          res.end();
+        }
+      });
+    });
+
+    server.once("error", reject);
+    server.listen(webhookConfig.port, webhookConfig.host, () => {
+      server.off("error", reject);
+      activeServer = server;
+      resolve(server);
+    });
+  });
+}
+
+async function handleWebhookRequest(req, res, webhookConfig) {
+  const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if ((req.method === "GET" || req.method === "HEAD") && requestUrl.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(req.method === "HEAD" ? "" : "ok\n");
+    return;
+  }
+
+  const pathMatch = matchWebhookPath(requestUrl.pathname, webhookConfig.path);
+  if (!pathMatch) {
+    sendJson(res, 404, { ok: false, error: "webhook path not found" });
+    return;
+  }
+
+  if (req.method !== "POST") {
+    sendJson(res, 405, { ok: false, error: "webhook requires POST" });
+    return;
+  }
+
+  if (webhookConfig.verifySecret && !requestHasWebhookSecret(req, webhookConfig.secretToken)) {
+    sendJson(res, 403, { ok: false, error: "webhook secret token mismatch" });
+    return;
+  }
+
+  const rawBody = await readRequestBody(req, maxWebhookBodyBytes);
+  const body = parseJSONBody(rawBody);
+  if (!body || typeof body !== "object") {
+    sendJson(res, 400, { ok: false, error: "webhook JSON body required" });
+    return;
+  }
+
+  const bot = resolveWebhookBot(pathMatch.botId || requestUrl.searchParams.get("bot_id") || "", body);
+  if (!bot) {
+    sendJson(res, 400, { ok: false, error: "cannot resolve bot for webhook request" });
+    return;
+  }
+
+  const updates = extractWebhookUpdates(body);
+  if (updates.length === 0) {
+    console.warn(`[bot ${bot.id}] Webhook received but no update payload was found.`);
+    sendJson(res, 400, { ok: false, error: "webhook update payload required" });
+    return;
+  }
+
+  for (const update of updates) {
+    await handleUpdate(bot, update);
+  }
+
+  sendJson(res, 200, { ok: true });
+}
+
+function waitForServerClose(server) {
+  return new Promise((resolve) => {
+    server.once("close", resolve);
+  });
+}
+
+function matchWebhookPath(pathname, basePath) {
+  const requestPath = normalizeWebhookPath(pathname);
+  const normalizedBase = normalizeWebhookPath(basePath);
+  if (requestPath === normalizedBase) {
+    return { botId: "" };
+  }
+  const prefix = `${normalizedBase}/`;
+  if (!requestPath.startsWith(prefix)) {
+    return null;
+  }
+  const botId = decodeURIComponent(requestPath.slice(prefix.length).split("/")[0] || "");
+  return { botId };
+}
+
+function resolveWebhookBot(botId, body) {
+  const explicitBotId = String(botId || inferWebhookBotId(body) || "").trim();
+  if (explicitBotId) {
+    return bots.find((bot) => bot.id === explicitBotId || tokenOwnerPrefix(bot.token) === explicitBotId) || null;
+  }
+  if (bots.length === 1) {
+    return bots[0];
+  }
+  return null;
+}
+
+function inferWebhookBotId(body) {
+  const payload = parseMaybeJSON(body.payload) || body.payload || body;
+  return body.bot_id
+    || body.botId
+    || body.bot?.id
+    || payload?.bot_id
+    || payload?.botId
+    || payload?.bot?.id
+    || "";
+}
+
+function extractWebhookUpdates(body) {
+  const payload = parseMaybeJSON(body.payload) || body.payload;
+  const candidates = [
+    payload?.update,
+    payload,
+    body.update,
+    body,
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate.filter(isWebhookUpdate);
+    }
+    if (Array.isArray(candidate?.updates)) {
+      return candidate.updates.filter(isWebhookUpdate);
+    }
+    if (isWebhookUpdate(candidate)) {
+      return [candidate];
+    }
+  }
+  return [];
+}
+
+function isWebhookUpdate(value) {
+  return Boolean(value && typeof value === "object" && (
+    value.message
+      || value.callback_query
+      || value.callbackQuery
+      || value.modal_submit
+      || value.modalSubmit
+  ));
+}
+
+function webhookUrlForBot(bot, webhookConfig) {
+  const replaced = webhookConfig.publicUrl
+    .replaceAll("{bot_id}", encodeURIComponent(bot.id))
+    .replaceAll("{botId}", encodeURIComponent(bot.id))
+    .replaceAll(":bot_id", encodeURIComponent(bot.id))
+    .replaceAll(":botId", encodeURIComponent(bot.id));
+  if (replaced !== webhookConfig.publicUrl || bots.length === 1) {
+    return replaced;
+  }
+
+  const url = new URL(webhookConfig.publicUrl);
+  url.pathname = appendPathSegment(url.pathname, bot.id);
+  return url.toString();
+}
+
+function requestHasWebhookSecret(req, secretToken) {
+  if (!secretToken) return true;
+  const candidates = [
+    req.headers["x-zapry-webhook-secret-token"],
+    req.headers["x-zapry-webhook-secret"],
+    req.headers["x-webhook-secret-token"],
+    req.headers["x-webhook-secret"],
+    req.headers["x-telegram-bot-api-secret-token"],
+    bearerToken(req.headers.authorization),
+  ].flatMap((value) => Array.isArray(value) ? value : [value]);
+
+  return candidates.some((value) => String(value || "") === secretToken);
+}
+
+function bearerToken(value) {
+  const text = String(value || "");
+  const match = text.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : "";
+}
+
+function readRequestBody(req, limitBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limitBytes) {
+        reject(new Error("webhook request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(`${JSON.stringify(body)}\n`);
 }
 
 async function checkBot(bot) {
@@ -84,6 +354,25 @@ async function preparePollingMode(bot) {
   if (webhook.result?.url) {
     console.log(`[bot ${bot.id}] Webhook is set. Deleting it so local getUpdates polling can work...`);
     await apiPost(bot, "deleteWebhook");
+  }
+}
+
+async function prepareWebhookMode(bot, webhookConfig) {
+  const url = webhookUrlForBot(bot, webhookConfig);
+  const body = { url };
+  if (webhookConfig.secretToken) {
+    body.secret_token = webhookConfig.secretToken;
+  }
+
+  await apiPost(bot, "setWebhook", body);
+  console.log(`[bot ${bot.id}] Webhook was set: ${url}`);
+
+  const webhook = await apiPost(bot, "getWebhookInfo").catch((error) => {
+    console.warn(`[bot ${bot.id}] Failed to verify webhook info: ${error.message}`);
+    return null;
+  });
+  if (webhook?.result?.url) {
+    console.log(`[bot ${bot.id}] Webhook info URL: ${webhook.result.url}`);
   }
 }
 
@@ -107,13 +396,15 @@ async function pollOnce(bot) {
 }
 
 async function handleUpdate(bot, update) {
-  if (update.callback_query) {
-    await handleCallback(bot, update.callback_query);
+  const callbackQuery = update.callback_query || update.callbackQuery;
+  if (callbackQuery) {
+    await handleCallback(bot, callbackQuery);
     return;
   }
 
-  if (update.modal_submit) {
-    await handleModalSubmit(bot, update.modal_submit);
+  const modalSubmit = update.modal_submit || update.modalSubmit;
+  if (modalSubmit) {
+    await handleModalSubmit(bot, modalSubmit);
     return;
   }
 
@@ -629,6 +920,14 @@ function parseMaybeJSON(value) {
   }
 }
 
+function parseJSONBody(value) {
+  try {
+    return JSON.parse(value || "{}");
+  } catch {
+    return null;
+  }
+}
+
 function humanReadableValues(values) {
   if (!values || typeof values !== "object") return "";
   return Object.entries(values)
@@ -708,10 +1007,26 @@ function parseRuntimeOptions(args) {
   const options = {
     mode: "",
     envName: "",
+    webhookUrl: "",
+    webhookHost: "",
+    webhookPort: "",
+    webhookPath: "",
+    webhookSecretToken: "",
+    verifyWebhookSecret: false,
+    noSetWebhook: false,
   };
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
+    if (arg === "--mode") {
+      options.mode = args[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--mode=")) {
+      options.mode = arg.slice("--mode=".length);
+      continue;
+    }
     if (arg === "--env" || arg === "-e") {
       options.envName = args[index + 1] || "";
       index += 1;
@@ -719,6 +1034,59 @@ function parseRuntimeOptions(args) {
     }
     if (arg.startsWith("--env=")) {
       options.envName = arg.slice("--env=".length);
+      continue;
+    }
+    if (arg === "--webhook-url") {
+      options.webhookUrl = args[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--webhook-url=")) {
+      options.webhookUrl = arg.slice("--webhook-url=".length);
+      continue;
+    }
+    if (arg === "--webhook-host") {
+      options.webhookHost = args[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--webhook-host=")) {
+      options.webhookHost = arg.slice("--webhook-host=".length);
+      continue;
+    }
+    if (arg === "--webhook-port") {
+      options.webhookPort = args[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--webhook-port=")) {
+      options.webhookPort = arg.slice("--webhook-port=".length);
+      continue;
+    }
+    if (arg === "--webhook-path") {
+      options.webhookPath = args[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--webhook-path=")) {
+      options.webhookPath = arg.slice("--webhook-path=".length);
+      continue;
+    }
+    if (arg === "--webhook-secret-token") {
+      options.webhookSecretToken = args[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--webhook-secret-token=")) {
+      options.webhookSecretToken = arg.slice("--webhook-secret-token=".length);
+      continue;
+    }
+    if (arg === "--verify-webhook-secret") {
+      options.verifyWebhookSecret = true;
+      continue;
+    }
+    if (arg === "--no-set-webhook") {
+      options.noSetWebhook = true;
       continue;
     }
     if (!options.mode) {
@@ -729,6 +1097,23 @@ function parseRuntimeOptions(args) {
   return options;
 }
 
+function normalizeRunMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized || normalized === "start" || normalized === "--start" || normalized === "poll" || normalized === "polling" || normalized === "--polling") {
+    return "polling";
+  }
+  if (normalized === "--check" || normalized === "check") {
+    return "check";
+  }
+  if (normalized === "--once" || normalized === "once") {
+    return "once";
+  }
+  if (normalized === "--webhook" || normalized === "webhook") {
+    return "webhook";
+  }
+  return normalized;
+}
+
 function normalizeEnvName(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized || normalized === "production") return "";
@@ -737,6 +1122,42 @@ function normalizeEnvName(value) {
 
 function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function normalizeWebhookUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    url.pathname = normalizeWebhookPath(url.pathname);
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    throw new Error(`Invalid ZAPRY_WEBHOOK_URL: ${text}`);
+  }
+}
+
+function normalizeWebhookPath(value) {
+  const text = String(value || defaultWebhookPath).trim();
+  const pathname = text.startsWith("http://") || text.startsWith("https://")
+    ? new URL(text).pathname
+    : text;
+  const withLeadingSlash = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return withLeadingSlash.replace(/\/+$/, "") || "/";
+}
+
+function appendPathSegment(pathname, segment) {
+  const basePath = normalizeWebhookPath(pathname);
+  const encoded = encodeURIComponent(segment);
+  return basePath === "/" ? `/${encoded}` : `${basePath}/${encoded}`;
+}
+
+function isTruthy(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function tokenOwnerPrefix(token) {
+  return String(token || "").split(":")[0] || "";
 }
 
 function parseBotTokens() {

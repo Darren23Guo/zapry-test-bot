@@ -1,6 +1,6 @@
 # Zapry Test Bot
 
-本地测试用 Zapry bot 后台服务。它使用 `getUpdates` 长轮询收消息，再用 `sendMessage` 回复。
+本地测试用 Zapry bot 后台服务。支持 `getUpdates` 长轮询和 webhook 两种收消息方式，再用 `sendMessage` 回复。
 
 ## 启动
 
@@ -16,6 +16,7 @@ npm run check:test
 npm run smoke:check:test
 npm run smoke:test
 npm run start:test
+npm run webhook:test
 ```
 
 启动后，在 Zapry iOS / Android 里给 bot 发：
@@ -60,6 +61,66 @@ ZAPRY_POLL_LIMIT=10
 
 ```bash
 node src/bot.js --env test --check
+```
+
+## getUpdates / Webhook 模式
+
+轮询模式仍然是默认启动方式，会先调用 `deleteWebhook`，保证 `getUpdates` 可用：
+
+```bash
+npm run start:test
+```
+
+webhook 模式会启动本地 HTTP receiver，并调用 `setWebhook` 把 bot 的 webhook URL 设置到 OpenAPI：
+
+```bash
+ZAPRY_WEBHOOK_URL=https://你的公网域名/zapry/webhooks npm run webhook:test
+```
+
+本地 receiver 默认监听：
+
+```text
+0.0.0.0:8080/zapry/webhooks
+```
+
+如果配置了多个 bot，脚本会自动给每个 bot 设置独立路径，例如：
+
+```text
+https://你的公网域名/zapry/webhooks/850672
+https://你的公网域名/zapry/webhooks/850709
+```
+
+常用配置：
+
+```bash
+ZAPRY_WEBHOOK_URL=https://你的公网域名/zapry/webhooks
+ZAPRY_WEBHOOK_HOST=0.0.0.0
+ZAPRY_WEBHOOK_PORT=8080
+ZAPRY_WEBHOOK_PATH=/zapry/webhooks
+ZAPRY_WEBHOOK_SECRET_TOKEN=optional-secret
+```
+
+也可以用命令行参数：
+
+```bash
+node src/bot.js --env test --webhook --webhook-url https://你的公网域名/zapry/webhooks --webhook-port 8080
+```
+
+如果只想本地启动 receiver，不想自动调用 `setWebhook`：
+
+```bash
+node src/bot.js --env test --webhook --no-set-webhook
+```
+
+收到 webhook 后，处理逻辑和轮询模式复用同一套命令，所以仍然可以在 App 里发送：
+
+```text
+/start
+hello
+/id
+/card
+/choice
+/modal
 ```
 
 ## OpenAPI Smoke 验证
@@ -149,9 +210,9 @@ Smoke summary: 1/1 bot(s) passed.
 ## 工作方式
 
 - 本地调试：使用 `getUpdates`，不需要公网地址。
-- 多个 bot：用英文逗号把多个 token 写进 `ZAPRY_BOT_TOKENS`，同一个后台进程会同时轮询。token 前缀重复时会自动生成 `603876_2` 这类本地 id，避免状态文件冲突。
-- 线上服务：建议改成 `Webhook`，需要公网 HTTPS endpoint。
-- 如果 webhook 已经设置，本服务启动时会先调用 `deleteWebhook`，让本地轮询模式可用。
+- Webhook 调试：使用 `npm run webhook:test`，需要公网 HTTPS endpoint 转发到本地 receiver。
+- 多个 bot：用英文逗号把多个 token 写进 `ZAPRY_BOT_TOKENS`，同一个后台进程会同时处理。token 前缀重复时会自动生成 `603876_2` 这类本地 id，避免状态文件冲突。
+- 轮询模式启动时会先调用 `deleteWebhook`，让 `getUpdates` 可用；webhook 模式启动时会调用 `setWebhook`。
 
 ## 后台服务
 
