@@ -20,6 +20,8 @@ const pollLimit = Number(process.env.ZAPRY_POLL_LIMIT || 10);
 const bots = parseBotTokens();
 const defaultWebhookPath = "/zapry/webhooks";
 const maxWebhookBodyBytes = 1024 * 1024;
+const logWebhookBody = isTruthy(process.env.ZAPRY_LOG_WEBHOOK_BODY);
+let eventCounter = 0;
 
 if (bots.length === 0) {
   console.error("Missing bot token. Put ZAPRY_BOT_TOKENS or ZAPRY_BOT_TOKEN in .env or the active .env.<env> file.");
@@ -156,39 +158,51 @@ function listenWebhookServer(webhookConfig) {
 
 async function handleWebhookRequest(req, res, webhookConfig) {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const eventId = nextEventId();
+  const startedAt = Date.now();
+  console.log(`[webhook ${eventId}] Incoming ${req.method} ${requestUrl.pathname} ua=${req.headers["user-agent"] || "(empty)"} len=${req.headers["content-length"] || "unknown"}`);
 
   if ((req.method === "GET" || req.method === "HEAD") && requestUrl.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(req.method === "HEAD" ? "" : "ok\n");
+    console.log(`[webhook ${eventId}] Health OK duration_ms=${Date.now() - startedAt}`);
     return;
   }
 
   const pathMatch = matchWebhookPath(requestUrl.pathname, webhookConfig.path);
   if (!pathMatch) {
     sendJson(res, 404, { ok: false, error: "webhook path not found" });
+    console.warn(`[webhook ${eventId}] Reject path not found path=${requestUrl.pathname} expected=${webhookConfig.path} duration_ms=${Date.now() - startedAt}`);
     return;
   }
 
   if (req.method !== "POST") {
     sendJson(res, 405, { ok: false, error: "webhook requires POST" });
+    console.warn(`[webhook ${eventId}] Reject method=${req.method} duration_ms=${Date.now() - startedAt}`);
     return;
   }
 
   if (webhookConfig.verifySecret && !requestHasWebhookSecret(req, webhookConfig.secretToken)) {
     sendJson(res, 403, { ok: false, error: "webhook secret token mismatch" });
+    console.warn(`[webhook ${eventId}] Reject secret mismatch bot_path=${pathMatch.botId || "(empty)"} duration_ms=${Date.now() - startedAt}`);
     return;
   }
 
   const rawBody = await readRequestBody(req, maxWebhookBodyBytes);
+  if (logWebhookBody) {
+    console.log(`[webhook ${eventId}] Body ${truncateForLog(rawBody, 4000)}`);
+  }
   const body = parseJSONBody(rawBody);
   if (!body || typeof body !== "object") {
     sendJson(res, 400, { ok: false, error: "webhook JSON body required" });
+    console.warn(`[webhook ${eventId}] Reject invalid JSON duration_ms=${Date.now() - startedAt}`);
     return;
   }
 
   const bot = resolveWebhookBot(pathMatch.botId || requestUrl.searchParams.get("bot_id") || "", body);
   if (!bot) {
     sendJson(res, 400, { ok: false, error: "cannot resolve bot for webhook request" });
+    console.warn(`[webhook ${eventId}] Reject cannot resolve bot path_bot=${pathMatch.botId || "(empty)"} duration_ms=${Date.now() - startedAt}`);
     return;
   }
 
@@ -196,14 +210,21 @@ async function handleWebhookRequest(req, res, webhookConfig) {
   if (updates.length === 0) {
     console.warn(`[bot ${bot.id}] Webhook received but no update payload was found.`);
     sendJson(res, 400, { ok: false, error: "webhook update payload required" });
+    console.warn(`[webhook ${eventId}] Reject no update payload bot=${bot.id} payload_keys=${Object.keys(body).join(",") || "(empty)"} duration_ms=${Date.now() - startedAt}`);
     return;
   }
 
   for (const update of updates) {
-    await handleUpdate(bot, update);
+    const summary = describeUpdate(update);
+    console.log(`[webhook ${eventId}] Dispatch bot=${bot.id} ${summary}`);
+    await handleUpdate(bot, update, { source: "webhook", eventId }).catch((error) => {
+      console.error(`[webhook ${eventId}] Handler failed bot=${bot.id} ${summary}: ${error.message}`);
+      throw error;
+    });
   }
 
   sendJson(res, 200, { ok: true });
+  console.log(`[webhook ${eventId}] OK bot=${bot.id} updates=${updates.length} duration_ms=${Date.now() - startedAt}`);
 }
 
 function waitForServerClose(server) {
@@ -364,6 +385,7 @@ async function prepareWebhookMode(bot, webhookConfig) {
     body.secret_token = webhookConfig.secretToken;
   }
 
+  console.log(`[bot ${bot.id}] setWebhook -> url=${url} secret=${webhookConfig.secretToken ? "configured" : "none"}`);
   await apiPost(bot, "setWebhook", body);
   console.log(`[bot ${bot.id}] Webhook was set: ${url}`);
 
@@ -371,8 +393,13 @@ async function prepareWebhookMode(bot, webhookConfig) {
     console.warn(`[bot ${bot.id}] Failed to verify webhook info: ${error.message}`);
     return null;
   });
-  if (webhook?.result?.url) {
-    console.log(`[bot ${bot.id}] Webhook info URL: ${webhook.result.url}`);
+  if (webhook?.result) {
+    console.log([
+      `[bot ${bot.id}] Webhook info`,
+      `url=${webhook.result.url || "(empty)"}`,
+      `pending=${webhook.result.pending_update_count ?? "(unknown)"}`,
+      `last_error=${webhook.result.last_error_message || "(none)"}`,
+    ].join(" "));
   }
 }
 
@@ -383,38 +410,54 @@ async function pollOnce(bot) {
     timeout: pollTimeout,
   });
 
-  for (const update of updates.result || []) {
+  const resultUpdates = updates.result || [];
+  if (resultUpdates.length > 0) {
+    console.log(`[bot ${bot.id}] Poll received updates=${resultUpdates.length} offset=${bot.offset}`);
+  }
+
+  for (const update of resultUpdates) {
     if (typeof update.update_id === "number") {
       bot.offset = update.update_id + 1;
       writeState(bot.stateFile, { offset: bot.offset });
     }
 
-    await handleUpdate(bot, update).catch((error) => {
-      console.error(`[bot ${bot.id}] Failed to handle update: ${error.message}`);
+    const summary = describeUpdate(update);
+    console.log(`[bot ${bot.id}] Poll dispatch ${summary}`);
+    await handleUpdate(bot, update, { source: "polling" }).catch((error) => {
+      console.error(`[bot ${bot.id}] Failed to handle update ${summary}: ${error.message}`);
     });
   }
 }
 
-async function handleUpdate(bot, update) {
+async function handleUpdate(bot, update, context = {}) {
+  const source = context.source || "unknown";
   const callbackQuery = update.callback_query || update.callbackQuery;
   if (callbackQuery) {
+    console.log(`[bot ${bot.id}] Handle callback source=${source} callback_id=${callbackQuery.id || "(empty)"} data=${callbackData(callbackQuery) || "(empty)"}`);
     await handleCallback(bot, callbackQuery);
     return;
   }
 
   const modalSubmit = update.modal_submit || update.modalSubmit;
   if (modalSubmit) {
+    console.log(`[bot ${bot.id}] Handle modal_submit source=${source} modal_id=${modalSubmit.modal_id || modalSubmit.modalId || "(unknown)"}`);
     await handleModalSubmit(bot, modalSubmit);
     return;
   }
 
   const message = update.message;
-  if (!message?.chat?.id) return;
+  if (!message?.chat?.id) {
+    console.warn(`[bot ${bot.id}] Skip update source=${source}: message/chat.id missing summary=${describeUpdate(update)}`);
+    return;
+  }
 
   const text = (message.text || "").trim();
-  if (!text) return;
+  if (!text) {
+    console.warn(`[bot ${bot.id}] Skip message source=${source}: empty text chat=${message.chat.id} message_id=${message.message_id || "(unknown)"} type=${message.chat.type || "(unknown)"}`);
+    return;
+  }
 
-  console.log(`[bot ${bot.id}] Received from chat ${message.chat.id}: ${text}`);
+  console.log(`[bot ${bot.id}] Received message source=${source} chat=${message.chat.id} chat_type=${message.chat.type || "(unknown)"} from=${message.from?.id || "(unknown)"} message_id=${message.message_id || "(unknown)"} text=${truncateForLog(text, 500)}`);
 
   if (text === "/start") {
     await sendMessage(bot, message.chat.id, [
@@ -636,19 +679,25 @@ async function handleModalSubmit(bot, modalSubmit) {
 }
 
 async function sendMessage(bot, chatId, text) {
-  await apiPost(bot, "sendMessage", {
+  console.log(`[bot ${bot.id}] sendMessage -> chat=${chatId} text_len=${String(text || "").length}`);
+  const result = await apiPost(bot, "sendMessage", {
     chat_id: String(chatId),
     text,
   });
+  console.log(`[bot ${bot.id}] sendMessage OK chat=${chatId} message_id=${result?.result?.message_id || result?.result?.messageId || "(unknown)"}`);
+  return result;
 }
 
 async function sendComponentMessage(bot, chatId, { text, fallback_text, components }) {
-  await apiPost(bot, "sendMessage", {
+  console.log(`[bot ${bot.id}] sendComponentMessage -> chat=${chatId} text_len=${String(text || "").length} components=${Array.isArray(components) ? components.length : 0}`);
+  const result = await apiPost(bot, "sendMessage", {
     chat_id: String(chatId),
     text,
     fallback_text,
     components,
   });
+  console.log(`[bot ${bot.id}] sendComponentMessage OK chat=${chatId} message_id=${result?.result?.message_id || result?.result?.messageId || "(unknown)"}`);
+  return result;
 }
 
 async function sendAgentCard(bot, chatId) {
@@ -814,11 +863,14 @@ function clientSideModalPayload() {
 
 async function answerCallback(bot, callbackQuery, body) {
   const chatId = callbackChatId(callbackQuery);
-  await apiPost(bot, "answerCallbackQuery", {
+  console.log(`[bot ${bot.id}] answerCallbackQuery -> callback_id=${callbackQuery.id || "(empty)"} chat=${chatId || "(empty)"} response_type=${body.response_type || "(empty)"}`);
+  const result = await apiPost(bot, "answerCallbackQuery", {
     chat_id: chatId ? String(chatId) : "",
     callback_query_id: callbackQuery.id,
     ...body,
   });
+  console.log(`[bot ${bot.id}] answerCallbackQuery OK callback_id=${callbackQuery.id || "(empty)"}`);
+  return result;
 }
 
 async function editCallbackSource(bot, callbackQuery, body) {
@@ -833,11 +885,14 @@ async function editCallbackSource(bot, callbackQuery, body) {
     return;
   }
 
-  await apiPost(bot, "editMessage", {
+  console.log(`[bot ${bot.id}] editMessage -> chat=${chatId} message=${messageId}`);
+  const result = await apiPost(bot, "editMessage", {
     chat_id: String(chatId),
     message_id: String(messageId),
     ...body,
   });
+  console.log(`[bot ${bot.id}] editMessage OK chat=${chatId} message=${messageId}`);
+  return result;
 }
 
 function isAgentCardCommand(text) {
@@ -928,6 +983,66 @@ function parseJSONBody(value) {
   }
 }
 
+function nextEventId() {
+  eventCounter += 1;
+  return `${Date.now().toString(36)}-${eventCounter}`;
+}
+
+function describeUpdate(update) {
+  if (!update || typeof update !== "object") {
+    return "type=unknown";
+  }
+
+  const callbackQuery = update.callback_query || update.callbackQuery;
+  if (callbackQuery) {
+    return [
+      "type=callback_query",
+      `update_id=${update.update_id ?? "(none)"}`,
+      `callback_id=${callbackQuery.id || "(empty)"}`,
+      `data=${truncateForLog(callbackData(callbackQuery) || "(empty)", 120)}`,
+      `chat=${callbackChatId(callbackQuery) || "(empty)"}`,
+      `message=${callbackMessageId(callbackQuery) || "(empty)"}`,
+    ].join(" ");
+  }
+
+  const modalSubmit = update.modal_submit || update.modalSubmit;
+  if (modalSubmit) {
+    const chatId = modalSubmit.source_message?.chat?.id
+      || modalSubmit.sourceMessage?.chat?.id
+      || modalSubmit.chat?.id
+      || modalSubmit.chat_id
+      || modalSubmit.chatId
+      || "";
+    return [
+      "type=modal_submit",
+      `update_id=${update.update_id ?? "(none)"}`,
+      `modal_id=${modalSubmit.modal_id || modalSubmit.modalId || "(unknown)"}`,
+      `chat=${chatId || "(empty)"}`,
+    ].join(" ");
+  }
+
+  const message = update.message;
+  if (message) {
+    return [
+      "type=message",
+      `update_id=${update.update_id ?? "(none)"}`,
+      `chat=${message.chat?.id || "(empty)"}`,
+      `chat_type=${message.chat?.type || "(unknown)"}`,
+      `from=${message.from?.id || "(unknown)"}`,
+      `message=${message.message_id || message.messageId || "(unknown)"}`,
+      `text=${truncateForLog((message.text || "").trim() || "(empty)", 120)}`,
+    ].join(" ");
+  }
+
+  return `type=unsupported update_id=${update.update_id ?? "(none)"} keys=${Object.keys(update).join(",") || "(empty)"}`;
+}
+
+function truncateForLog(value, maxLength) {
+  const text = String(value ?? "");
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}...(${text.length} chars)`;
+}
+
 function humanReadableValues(values) {
   if (!values || typeof values !== "object") return "";
   return Object.entries(values)
@@ -941,6 +1056,9 @@ async function apiGet(bot, method) {
 }
 
 async function apiPost(bot, method, body = {}) {
+  if (method === "setWebhook" || method === "deleteWebhook" || method === "getWebhookInfo") {
+    console.log(`[bot ${bot.id}] API ${method} -> ${baseUrl}/${redactToken(bot.token)}/${method}`);
+  }
   const response = await fetchAPI(bot, method, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -963,11 +1081,12 @@ function networkErrorMessage(error) {
 }
 
 async function parseResponse(method, response) {
-  const payload = await response.json().catch(() => null);
+  const text = await response.text();
+  const payload = parseJSONBody(text);
 
   if (!response.ok || !payload?.ok) {
-    const description = payload?.description || response.statusText || "Unknown error";
-    throw new Error(`${method} failed: ${description}`);
+    const description = payload?.description || payload?.error || response.statusText || "Unknown error";
+    throw new Error(`${method} failed: status=${response.status} description=${description} body=${truncateForLog(text, 1000)}`);
   }
 
   return payload;
@@ -1158,6 +1277,13 @@ function isTruthy(value) {
 
 function tokenOwnerPrefix(token) {
   return String(token || "").split(":")[0] || "";
+}
+
+function redactToken(token) {
+  const text = String(token || "");
+  const [prefix, secret = ""] = text.split(":");
+  if (!secret) return prefix ? `${prefix}:***` : "***";
+  return `${prefix}:${secret.slice(0, 4)}...${secret.slice(-4)}`;
 }
 
 function parseBotTokens() {
